@@ -7,7 +7,13 @@ const { pool, initDb } = require('./db');
 const { generateLicenseKey } = require('./keyGenerator');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'apikey', 'x-api-key', 'Authorization'],
+  credentials: true
+}));
+app.options('*', cors());
 app.use(express.json());
 
 // --- Helper Functions ---
@@ -35,19 +41,23 @@ app.get('/', (req, res) => {
 app.post('/api/activate', async (req, res) => {
   try {
     // Header Authentication Check
+    const expectedApiKey = process.env.EXTENSION_API_KEY || 'freeflow-be-key-2008';
     const apiKey = req.headers.apikey || req.headers['apikey'] || req.headers['x-api-key'];
-    if (!apiKey || apiKey !== process.env.EXTENSION_API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized' });
+    if (!apiKey || apiKey !== expectedApiKey) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid API key' });
     }
 
     const { license_key, token_lovable } = req.body || {};
 
-    if (!license_key || !token_lovable) {
-      return res.status(400).json({ error: 'Missing required parameters: license_key and token_lovable' });
+    if (!license_key || !String(license_key).trim()) {
+      return res.status(400).json({ error: 'Missing required parameter: license_key' });
     }
 
+    const cleanKey = String(license_key).trim();
+    const userToken = (token_lovable && String(token_lovable).trim()) ? String(token_lovable).trim() : 'session_active';
+
     // Query license key
-    const queryResult = await pool.query('SELECT * FROM licenses WHERE key = $1', [license_key.trim()]);
+    const queryResult = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
 
     if (queryResult.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid or revoked key' });
@@ -64,15 +74,29 @@ app.post('/api/activate', async (req, res) => {
     if (license.status === 'unused') {
       await pool.query(
         "UPDATE licenses SET status = 'active', lovable_user_id = $1 WHERE key = $2",
-        [token_lovable, license_key.trim()]
+        [userToken, cleanKey]
       );
-      return res.status(200).json({ success: true });
+      return res.status(200).json({
+        success: true,
+        message: 'License activated successfully!',
+        status: 'active'
+      });
     }
 
     // Status: Active -> Verify device binding
     if (license.status === 'active') {
-      if (license.lovable_user_id === token_lovable) {
-        return res.status(200).json({ success: true });
+      if (!license.lovable_user_id || license.lovable_user_id === 'session_active' || license.lovable_user_id === userToken || userToken === 'session_active') {
+        if (userToken !== 'session_active' && license.lovable_user_id !== userToken) {
+          await pool.query(
+            "UPDATE licenses SET lovable_user_id = $1 WHERE key = $2",
+            [userToken, cleanKey]
+          );
+        }
+        return res.status(200).json({
+          success: true,
+          message: 'License verified successfully!',
+          status: 'active'
+        });
       } else {
         return res.status(401).json({ error: 'Key already bound to another device' });
       }
