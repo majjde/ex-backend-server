@@ -168,7 +168,7 @@ app.post('/api/activate', async (req, res) => {
 
     return res.status(401).json({ error: 'Invalid or revoked key' });
   } catch (error) {
-    console.error('Error during license activation:', error);
+    console.error('Error during license activation:', error.message);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -309,7 +309,7 @@ app.post('/api/payment-sms', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error handling payment SMS webhook:', error);
+    console.error('Error handling payment SMS webhook:', error.message);
     return res.status(500).json({ error: 'Internal server error processing webhook' });
   }
 });
@@ -532,7 +532,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
 
         return bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
       } catch (err) {
-        console.error('Error fetching user keys:', err);
+        console.error('Error fetching user keys:', err.message);
         return bot.sendMessage(chatId, '❌ Failed to fetch your license keys.');
       }
     }
@@ -579,7 +579,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         await pool.query('INSERT INTO licenses (key, status) VALUES ($1, $2)', [key, 'unused']);
         return bot.sendMessage(chatId, `✅ *New License Key Generated:*\n\n\`${key}\`\n\nStatus: \`unused\``, { parse_mode: 'Markdown' });
       } catch (err) {
-        console.error('Error generating key:', err);
+        console.error('Error generating key:', err.message);
         return bot.sendMessage(chatId, '❌ Failed to generate key due to database error.');
       }
     }
@@ -598,7 +598,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         const reply = `📊 *License Key Statistics:*\n\n🟢 *Active:* ${counts.active || 0}\n🟡 *Unused:* ${counts.unused || 0}\n🔴 *Revoked:* ${counts.revoked || 0}\n\n📦 *Total Keys:* ${total}`;
         return bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
       } catch (err) {
-        console.error('Error getting stats:', err);
+        console.error('Error getting stats:', err.message);
         return bot.sendMessage(chatId, '❌ Failed to query key statistics.');
       }
     }
@@ -687,7 +687,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         await pool.query('INSERT INTO licenses (key, status) VALUES ($1, $2)', [key, 'unused']);
         return bot.sendMessage(chatId, `✅ *New License Key Generated:*\n\n\`${key}\`\n\nStatus: \`unused\``, { parse_mode: 'Markdown' });
       } catch (err) {
-        console.error('Error generating key:', err);
+        console.error('Error generating key:', err.message);
         return bot.sendMessage(chatId, '❌ Failed to generate key due to a database error.');
       }
     }
@@ -705,7 +705,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         const reply = `📊 *License Key Statistics:*\n\n🟢 *Active:* ${counts.active || 0}\n🟡 *Unused:* ${counts.unused || 0}\n🔴 *Revoked:* ${counts.revoked || 0}\n\n📦 *Total Keys:* ${total}`;
         return bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
       } catch (err) {
-        console.error('Error querying list:', err);
+        console.error('Error querying list:', err.message);
         return bot.sendMessage(chatId, '❌ Failed to fetch key statistics.');
       }
     }
@@ -727,7 +727,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
           return bot.sendMessage(chatId, `❌ License key \`${keyToRevoke}\` was not found.`, { parse_mode: 'Markdown' });
         }
       } catch (err) {
-        console.error('Error revoking key:', err);
+        console.error('Error revoking key:', err.message);
         return bot.sendMessage(chatId, '❌ Database error while revoking key.');
       }
     }
@@ -839,7 +839,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error('Error saving pending transaction UTR:', err);
+        console.error('Error saving pending transaction UTR:', err.message);
         return bot.sendMessage(chatId, '❌ Failed to process your UTR submission. Please try again.');
       }
     }
