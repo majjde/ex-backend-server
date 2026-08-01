@@ -3,7 +3,7 @@ const cors = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
 
-const { pool, initDb, getSetting, setSetting, getAllSettings } = require('./db');
+const { pool, initDb, getSetting, setSetting, getAllSettings, getAdminKeyStats, getActiveLicensesWithUsers } = require('./db');
 const { generateLicenseKey } = require('./keyGenerator');
 
 const app = express();
@@ -33,6 +33,32 @@ function isAuthorizedAdmin(msgOrId) {
   }
 
   return chatId === targetAdminId;
+}
+
+// --- Admin Telegram Notification Helper ---
+async function notifyAdmin(msgText) {
+  const adminId = process.env.ADMIN_CHAT_ID;
+  if (!bot || !adminId || !String(adminId).trim()) return;
+  try {
+    await bot.sendMessage(String(adminId).trim(), msgText, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('Error sending admin notification:', err?.message || err);
+  }
+}
+
+function notifyAdminPaymentSession(fromUser, productName) {
+  if (!fromUser) return;
+  const usernameStr = fromUser.username ? `@${fromUser.username}` : 'None';
+  const fullName = [fromUser.first_name, fromUser.last_name].filter(Boolean).join(' ') || 'N/A';
+  const timeStr = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) + ' IST';
+
+  const notice = `💳 *Payment Session Initiated*\n\n` +
+    `👤 *Telegram Username:* ${usernameStr}\n` +
+    `📛 *Full Name:* ${fullName}\n` +
+    `🆔 *Telegram User ID:* \`${fromUser.id}\`\n` +
+    `📦 *Selected Product:* ${productName}\n` +
+    `⏰ *Timestamp:* ${timeStr}`;
+  notifyAdmin(notice);
 }
 
 // --- Regex Helpers for SMS & UTR Extraction ---
@@ -271,6 +297,15 @@ app.post('/api/payment-sms', async (req, res) => {
           `You can activate this key in the extension. View your keys anytime under the *My Key* menu option.`;
         bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
       }
+
+      // Notify Admin Chat of Verified Payment & License Fulfillment
+      const adminMsg = `✅ *Payment Verification Success*\n\n` +
+        `👤 *Telegram ID:* \`${telegramId}\`\n` +
+        `📦 *Product:* Extension License Key\n` +
+        `💳 *UTR:* \`${rrn}\`\n` +
+        `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}\n` +
+        `🔑 *Generated Key:* \`${newKey}\``;
+      notifyAdmin(adminMsg);
     } else if (intent === 'course') {
       const courseChannelId = (await getSetting('course_channel_id', '')) || process.env.FORCE_JOIN_CHANNEL_ID || '';
       let inviteLinkUrl = '';
@@ -299,6 +334,14 @@ app.post('/api/payment-sms', async (req, res) => {
 
         bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
       }
+
+      // Notify Admin Chat of Verified Payment & Course Fulfillment
+      const adminMsg = `✅ *Payment Verification Success*\n\n` +
+        `👤 *Telegram ID:* \`${telegramId}\`\n` +
+        `📦 *Product:* Learn Website Creation with AI Course\n` +
+        `💳 *UTR:* \`${rrn}\`\n` +
+        `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}`;
+      notifyAdmin(adminMsg);
     }
 
     return res.status(200).json({
@@ -557,6 +600,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       const customMsg = await getSetting('license_custom_msg', 'Scan the QR code or send payment to the UPI ID.');
 
       userStates[chatId] = { action: 'awaiting_utr', intent: 'license' };
+      notifyAdminPaymentSession(query.from, 'Extension License Key');
 
       const caption = `🔑 *Buy Extension License Key*\n\n` +
         `💰 *Price:* Rs. ${price}\n` +
@@ -604,6 +648,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       const customMsg = await getSetting('course_custom_msg', 'Scan the QR code or pay via UPI to enroll.');
 
       userStates[chatId] = { action: 'awaiting_utr', intent: 'course' };
+      notifyAdminPaymentSession(query.from, 'Learn Website Creation with AI Course');
 
       const caption = `🎓 *Learn Website Creation with AI Course*\n\n` +
         `💰 *Price:* Rs. ${price}\n` +
@@ -778,20 +823,67 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
 
     if (data === 'admin_key_stats') {
       try {
-        const result = await pool.query(
-          'SELECT status, COUNT(*)::int as count FROM licenses GROUP BY status'
-        );
-        const counts = { active: 0, unused: 0, revoked: 0 };
-        let total = 0;
-        result.rows.forEach(r => {
-          counts[r.status] = parseInt(r.count, 10);
-          total += parseInt(r.count, 10);
-        });
-        const reply = `📊 *License Key Statistics:*\n\n🟢 *Active:* ${counts.active || 0}\n🟡 *Unused:* ${counts.unused || 0}\n🔴 *Revoked:* ${counts.revoked || 0}\n\n📦 *Total Keys:* ${total}`;
-        return safeEditMessage(chatId, messageId, reply, adminOpts);
+        const stats = await getAdminKeyStats();
+        const reply = `📊 *License Key Statistics & Overview:*\n\n` +
+          `🟢 *Active Keys:* ${stats.active}\n` +
+          `🟡 *Unused Keys:* ${stats.unused}\n` +
+          `🔴 *Revoked Keys:* ${stats.revoked}\n\n` +
+          `📦 *Product Sales Breakdown:*\n` +
+          `• Total Extension Keys Generated: *${stats.totalKeys}*\n` +
+          `• Total Course Accesses Granted: *${stats.totalCourseAccesses}*\n\n` +
+          `👥 *Total Unique Purchasing Users:* *${stats.uniqueBuyers}*`;
+
+        const statsOpts = {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔑 Get All Active Keys', callback_data: 'admin_get_active_keys' }],
+              [{ text: '🔙 Back to Admin', callback_data: 'back_to_admin' }]
+            ]
+          }
+        };
+
+        return safeEditMessage(chatId, messageId, reply, statsOpts);
       } catch (err) {
         console.error('Error getting stats:', err?.message || err);
         return safeEditMessage(chatId, messageId, '❌ Failed to query key statistics.', adminOpts);
+      }
+    }
+
+    if (data === 'admin_get_active_keys') {
+      try {
+        const activeKeys = await getActiveLicensesWithUsers();
+        if (activeKeys.length === 0) {
+          return safeEditMessage(chatId, messageId, 'ℹ️ *No currently active license keys found.*', adminOpts);
+        }
+
+        let reply = `🔑 *All Currently Active License Keys (${activeKeys.length}):*\n\n`;
+        activeKeys.forEach((k, idx) => {
+          const tgUser = k.telegram_id ? `\`${k.telegram_id}\`` : 'Not Bound';
+          const lovableUser = k.lovable_user_id ? `\`${k.lovable_user_id}\`` : 'N/A';
+          const hw = k.hw_fingerprint ? `\`${k.hw_fingerprint}\`` : 'Not Bound';
+          const dateStr = k.created_at ? new Date(k.created_at).toISOString().split('T')[0] : 'N/A';
+
+          reply += `*${idx + 1}. Key:* \`${k.key}\`\n` +
+            `   👤 *TG User ID:* ${tgUser}\n` +
+            `   💻 *HW Fingerprint:* ${hw}\n` +
+            `   🆔 *Lovable Session:* ${lovableUser}\n` +
+            `   📅 *Created:* ${dateStr}\n\n`;
+        });
+
+        if (reply.length > 4000) {
+          const chunks = reply.match(/[\s\S]{1,3800}(?=\n\n|\s|$)/g) || [reply];
+          await safeEditMessage(chatId, messageId, chunks[0], adminOpts);
+          for (let i = 1; i < chunks.length; i++) {
+            await bot.sendMessage(chatId, chunks[i], adminOpts);
+          }
+          return;
+        }
+
+        return safeEditMessage(chatId, messageId, reply, adminOpts);
+      } catch (err) {
+        console.error('Error getting active keys:', err?.message || err);
+        return safeEditMessage(chatId, messageId, '❌ Failed to fetch active keys.', adminOpts);
       }
     }
   });
@@ -907,15 +999,27 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         return bot.sendMessage(chatId, 'Unauthorized. Please send /start to continue.').catch(err => console.error('Telegram sendMessage error:', err?.message || err));
       }
       try {
-        const result = await pool.query('SELECT status, COUNT(*)::int as count FROM licenses GROUP BY status');
-        const counts = { active: 0, unused: 0, revoked: 0 };
-        let total = 0;
-        result.rows.forEach((row) => {
-          counts[row.status] = parseInt(row.count, 10);
-          total += parseInt(row.count, 10);
-        });
-        const reply = `📊 *License Key Statistics:*\n\n🟢 *Active:* ${counts.active || 0}\n🟡 *Unused:* ${counts.unused || 0}\n🔴 *Revoked:* ${counts.revoked || 0}\n\n📦 *Total Keys:* ${total}`;
-        return bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+        const stats = await getAdminKeyStats();
+        const reply = `📊 *License Key Statistics & Overview:*\n\n` +
+          `🟢 *Active Keys:* ${stats.active}\n` +
+          `🟡 *Unused Keys:* ${stats.unused}\n` +
+          `🔴 *Revoked Keys:* ${stats.revoked}\n\n` +
+          `📦 *Product Sales Breakdown:*\n` +
+          `• Total Extension Keys Generated: *${stats.totalKeys}*\n` +
+          `• Total Course Accesses Granted: *${stats.totalCourseAccesses}*\n\n` +
+          `👥 *Total Unique Purchasing Users:* *${stats.uniqueBuyers}*`;
+
+        const statsOpts = {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔑 Get All Active Keys', callback_data: 'admin_get_active_keys' }],
+              [{ text: '🔙 Back to Admin', callback_data: 'back_to_admin' }]
+            ]
+          }
+        };
+
+        return bot.sendMessage(chatId, reply, statsOpts);
       } catch (err) {
         console.error('Error querying list:', err?.message || err);
         return bot.sendMessage(chatId, '❌ Failed to fetch key statistics.');

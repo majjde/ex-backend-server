@@ -122,10 +122,72 @@ async function getAllSettings() {
   }
 }
 
+async function getAdminKeyStats() {
+  try {
+    const statusRes = await pool.query(
+      'SELECT status, COUNT(*)::int as count FROM licenses GROUP BY status'
+    );
+    const counts = { active: 0, unused: 0, revoked: 0 };
+    let totalKeys = 0;
+    statusRes.rows.forEach(r => {
+      counts[r.status] = parseInt(r.count, 10);
+      totalKeys += parseInt(r.count, 10);
+    });
+
+    const courseRes = await pool.query(
+      "SELECT COUNT(*)::int as count FROM pending_transactions WHERE intent = 'course' AND status = 'verified'"
+    );
+    const totalCourseAccesses = courseRes.rows[0]?.count || 0;
+
+    const uniqueBuyersRes = await pool.query(`
+      SELECT COUNT(DISTINCT telegram_id)::int as count FROM (
+        SELECT telegram_id FROM licenses WHERE telegram_id IS NOT NULL AND telegram_id != ''
+        UNION
+        SELECT telegram_id FROM pending_transactions WHERE status = 'verified' AND telegram_id IS NOT NULL AND telegram_id != ''
+      ) AS buyers
+    `);
+    const uniqueBuyers = uniqueBuyersRes.rows[0]?.count || 0;
+
+    return {
+      active: counts.active || 0,
+      unused: counts.unused || 0,
+      revoked: counts.revoked || 0,
+      totalKeys,
+      totalCourseAccesses,
+      uniqueBuyers
+    };
+  } catch (err) {
+    console.error('Error fetching admin key stats:', err?.message || err);
+    return {
+      active: 0,
+      unused: 0,
+      revoked: 0,
+      totalKeys: 0,
+      totalCourseAccesses: 0,
+      uniqueBuyers: 0
+    };
+  }
+}
+
+async function getActiveLicensesWithUsers() {
+  try {
+    const res = await pool.query(
+      "SELECT key, status, telegram_id, lovable_user_id, hw_fingerprint, created_at FROM licenses WHERE status = 'active' ORDER BY id DESC"
+    );
+    return res.rows;
+  } catch (err) {
+    console.error('Error fetching active licenses:', err?.message || err);
+    return [];
+  }
+}
+
 module.exports = {
   pool,
   initDb,
   getSetting,
   setSetting,
   getAllSettings,
+  getAdminKeyStats,
+  getActiveLicensesWithUsers,
 };
+
