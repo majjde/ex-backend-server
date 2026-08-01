@@ -10,7 +10,7 @@ const app = express();
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'apikey', 'x-api-key', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'apikey', 'x-api-key', 'Authorization', 'x-macrodroid-secret', 'macrodroid-secret'],
   credentials: true
 }));
 app.options('*', cors());
@@ -41,7 +41,6 @@ function extractRrnAndAmount(smsText) {
     return { rrn: null, amount: null };
   }
 
-  // 1. Extract RRN / UTR (12 digits)
   let rrnMatch = smsText.match(/RRN-?\s*(\d{12})/i) ||
                  smsText.match(/UTR-?\s*(\d{12})/i) ||
                  smsText.match(/Ref-?\s*(\d{12})/i) ||
@@ -49,7 +48,6 @@ function extractRrnAndAmount(smsText) {
 
   const rrn = rrnMatch ? rrnMatch[1] : null;
 
-  // 2. Extract Amount
   let amountMatch = smsText.match(/(?:Rs\.?|INR)\s*([\d,]+(?:\.\d{1,2})?)/i) ||
                     smsText.match(/received\s*(?:Rs\.?|INR)?\s*([\d,]+(?:\.\d{1,2})?)/i);
 
@@ -169,6 +167,21 @@ app.post('/api/activate', async (req, res) => {
 // Macrodroid Payment SMS Webhook Endpoint (/api/payment-sms)
 app.post('/api/payment-sms', async (req, res) => {
   try {
+    // 1. Strict Webhook Authorization Check via MACRODROID_SECRET
+    const expectedMacrodroidSecret = process.env.MACRODROID_SECRET;
+    if (expectedMacrodroidSecret && String(expectedMacrodroidSecret).trim() !== '') {
+      const clientSecret = req.headers['x-macrodroid-secret'] ||
+                           req.headers['macrodroid-secret'] ||
+                           req.headers['authorization'] ||
+                           req.query.secret ||
+                           (req.body && req.body.secret);
+
+      if (!clientSecret || String(clientSecret).trim() !== String(expectedMacrodroidSecret).trim()) {
+        console.warn('⚠️ Webhook unauthorized: Invalid or missing MACRODROID_SECRET');
+        return res.status(401).json({ error: 'Unauthorized: Invalid Macrodroid secret' });
+      }
+    }
+
     const payload = req.body || {};
     const smsText = typeof payload === 'string'
       ? payload
@@ -364,7 +377,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     return {
       inline_keyboard: [
         [{ text: '🔑 Buy Key', callback_data: 'user_buy_key' }],
-        [{ text: '🎓 Learn website creation with AI', callback_data: 'user_buy_course' }],
+        [{ text: '🎓 Learn website creation with AI', callback_data: 'user_course_intro' }],
         [
           { text: '📥 Get Extension', callback_data: 'user_download_ext' },
           { text: '📖 How to Use', callback_data: 'user_how_to_use' }
@@ -444,6 +457,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
           [{ text: '📝 Set Welcome Message', callback_data: 'admin_set_welcome' }],
           [{ text: '💳 Set License Payment Info', callback_data: 'admin_set_license_pay' }],
           [{ text: '🎓 Set Course Payment Info', callback_data: 'admin_set_course_pay' }],
+          [{ text: '🎓 Set Course Intro Msg', callback_data: 'admin_set_course_intro' }],
           [{ text: '📦 Upload Extension (.zip)', callback_data: 'admin_upload_ext' }],
           [{ text: '📖 Set "How to Use" Msg', callback_data: 'admin_set_how_to_use' }],
           [
@@ -495,10 +509,20 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       }
     }
 
-    // Back to Main Menu Callback
+    // Back to Main User Menu Callback
     if (data === 'back_to_main') {
       delete userStates[chatId];
       return editToMainUserMenu(chatId, messageId);
+    }
+
+    // Back to Admin Dashboard Callback
+    if (data === 'back_to_admin') {
+      delete adminStates[chatId];
+      if (isAuthorizedAdmin(userId)) {
+        return sendAdminPanel(chatId, messageId);
+      } else {
+        return editToMainUserMenu(chatId, messageId);
+      }
     }
 
     // Cancel Payment Callback
@@ -524,6 +548,8 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     }
 
     // --- User Callback Handlers ---
+
+    // 1. Buy License Key (Active Payment State: ONLY Cancel Payment button)
     if (data === 'user_buy_key') {
       const price = await getSetting('license_price', '0');
       const upiId = await getSetting('license_upi_id', 'Not Set');
@@ -542,8 +568,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '❌ Cancel Payment', callback_data: 'cancel_payment' }],
-            [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+            [{ text: '❌ Cancel Payment', callback_data: 'cancel_payment' }]
           ]
         }
       };
@@ -551,6 +576,27 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       return safeSendOrEditWithPhoto(chatId, messageId, caption, qrPhoto, opts);
     }
 
+    // 2. Course Intermediate Intro View
+    if (data === 'user_course_intro') {
+      const defaultIntro = `🎓 *Learn Website Creation with AI Course*\n\n` +
+        `Master building modern web applications with AI tools! Gain instant access to video guides, templates, and full source code.\n\n` +
+        `Click *Get Access* below to enroll.`;
+      const introMsg = await getSetting('course_intro_message', defaultIntro);
+
+      const opts = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🚀 Get Access', callback_data: 'user_buy_course' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+          ]
+        }
+      };
+
+      return safeEditMessage(chatId, messageId, introMsg, opts);
+    }
+
+    // 3. Buy Course / Get Access (Active Payment State: ONLY Cancel Payment button)
     if (data === 'user_buy_course') {
       const price = await getSetting('course_price', '0');
       const upiId = await getSetting('course_upi_id', 'Not Set');
@@ -569,8 +615,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '❌ Cancel Payment', callback_data: 'cancel_payment' }],
-            [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+            [{ text: '❌ Cancel Payment', callback_data: 'cancel_payment' }]
           ]
         }
       };
@@ -663,14 +708,14 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       }
     }
 
-    // --- Admin Callback Handlers ---
+    // --- Admin Callback Handlers (Use back_to_admin for navigation) ---
     if (!isAuthorizedAdmin(userId)) return;
 
     const adminOpts = {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+          [{ text: '🔙 Back to Admin', callback_data: 'back_to_admin' }]
         ]
       }
     };
@@ -696,6 +741,16 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         chatId,
         messageId,
         `🎓 *Set Course Payment Info*\n\nPlease reply with text in this format:\n\n\`UPI_ID | Price | Channel_ID | Custom Message\`\n\nExample:\n\`course@upi | 999 | -100123456789 | Get instant private channel invite link.\`\n\n*(To update the QR Code photo, send an image in your next message)*`,
+        adminOpts
+      );
+    }
+
+    if (data === 'admin_set_course_intro') {
+      adminStates[chatId] = { action: 'awaiting_course_intro_msg' };
+      return safeEditMessage(
+        chatId,
+        messageId,
+        `🎓 *Set Course Intro Message*\n\nPlease send the intro text for the course (displayed when user clicks the Course menu button):`,
         adminOpts
       );
     }
@@ -758,7 +813,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+            [{ text: '🔙 Back to Admin', callback_data: 'back_to_admin' }]
           ]
         }
       };
@@ -781,7 +836,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+          [{ text: '🔙 Back to Admin', callback_data: 'back_to_admin' }]
         ]
       }
     };
@@ -899,7 +954,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+            [{ text: '🔙 Back to Admin', callback_data: 'back_to_admin' }]
           ]
         }
       };
@@ -914,6 +969,12 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         await setSetting('how_to_use_msg', text);
         delete adminStates[chatId];
         return bot.sendMessage(chatId, '✅ *"How to Use" guide message updated successfully!*', opts);
+      }
+
+      if (state.action === 'awaiting_course_intro_msg') {
+        await setSetting('course_intro_message', text);
+        delete adminStates[chatId];
+        return bot.sendMessage(chatId, '✅ *Course Intro Message updated successfully!*', opts);
       }
 
       if (state.action === 'awaiting_license_pay_info') {
@@ -960,21 +1021,21 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       }
     }
 
-    // User AWAITING_UTR State Handling
+    // User AWAITING_UTR State Handling (Payment State UX: ONLY Cancel Payment button during active payment)
     if (userStates[chatId] && userStates[chatId].action === 'awaiting_utr') {
       const extractedUtr = extractUtrFromUserText(text);
 
+      const cancelOpts = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '❌ Cancel Payment', callback_data: 'cancel_payment' }]
+          ]
+        }
+      };
+
       if (!extractedUtr) {
-        const opts = {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '❌ Cancel Payment', callback_data: 'cancel_payment' }],
-              [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
-            ]
-          }
-        };
-        return bot.sendMessage(chatId, 'Please send a valid 12-digit UTR/RRN number.', opts);
+        return bot.sendMessage(chatId, 'Please send a valid 12-digit UTR/RRN number.', cancelOpts);
       }
 
       const intent = userStates[chatId].intent || 'license';
@@ -982,30 +1043,19 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       try {
         const existingTx = await pool.query('SELECT * FROM pending_transactions WHERE utr = $1', [extractedUtr]);
 
-        const opts = {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
-            ]
-          }
-        };
-
         if (existingTx.rows.length > 0) {
           const tx = existingTx.rows[0];
           if (tx.status === 'verified') {
-            delete userStates[chatId];
             return bot.sendMessage(
               chatId,
               `❌ *This UTR (${extractedUtr}) has already been verified and claimed.*`,
-              opts
+              cancelOpts
             );
           } else if (tx.status === 'pending_verification') {
-            delete userStates[chatId];
             return bot.sendMessage(
               chatId,
               `⏳ *Payment verification is already in progress for UTR (${extractedUtr}). Please wait up to 2 minutes...*`,
-              opts
+              cancelOpts
             );
           }
         }
@@ -1020,16 +1070,14 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
           [String(chatId), intent, extractedUtr, targetPrice]
         );
 
-        delete userStates[chatId];
-
         return bot.sendMessage(
           chatId,
           `⏳ *Payment is verifying for UTR: \`${extractedUtr}\`. Please wait up to 2 minutes...*`,
-          opts
+          cancelOpts
         );
       } catch (err) {
         console.error('Error saving pending transaction UTR:', err?.message || err);
-        return bot.sendMessage(chatId, '❌ Failed to process your UTR submission. Please try again.');
+        return bot.sendMessage(chatId, '❌ Failed to process your UTR submission. Please try again.', cancelOpts);
       }
     }
 
