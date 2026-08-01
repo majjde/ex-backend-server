@@ -76,7 +76,7 @@ async function initDb() {
       client.release();
     }
   } catch (err) {
-    console.error('❌ Error initializing database schema:', err.message);
+    console.error('❌ Error initializing database schema:', err?.message || err);
   }
 }
 
@@ -88,7 +88,7 @@ async function getSetting(key, defaultValue = '') {
     }
     return defaultValue;
   } catch (err) {
-    console.error(`Error fetching setting ${key}:`, err.message);
+    console.error(`Error fetching setting ${key}:`, err?.message || err);
     return defaultValue;
   }
 }
@@ -103,7 +103,7 @@ async function setSetting(key, value) {
     );
     return true;
   } catch (err) {
-    console.error(`Error setting ${key}:`, err.message);
+    console.error(`Error setting ${key}:`, err?.message || err);
     return false;
   }
 }
@@ -117,7 +117,7 @@ async function getAllSettings() {
     });
     return settings;
   } catch (err) {
-    console.error('Error fetching all settings:', err.message);
+    console.error('Error fetching all settings:', err?.message || err);
     return {};
   }
 }
