@@ -36,6 +36,12 @@ function isAuthorizedAdmin(msgOrId) {
 }
 
 // --- Admin Telegram Notification Helper ---
+// Escape special Markdown characters in user-provided strings
+function escapeMd(str) {
+  if (!str) return '';
+  return String(str).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
 async function notifyAdmin(msgText) {
   const adminId = process.env.ADMIN_CHAT_ID;
   if (!bot || !adminId || !String(adminId).trim()) return;
@@ -43,13 +49,21 @@ async function notifyAdmin(msgText) {
     await bot.sendMessage(String(adminId).trim(), msgText, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('Error sending admin notification:', err?.message || err);
+    // Retry without parse_mode if Markdown parsing fails
+    try {
+      const plainText = msgText.replace(/[*`_~]/g, '');
+      await bot.sendMessage(String(adminId).trim(), plainText);
+    } catch (retryErr) {
+      console.error('Error sending admin notification (plain retry):', retryErr?.message || retryErr);
+    }
   }
 }
 
 function notifyAdminPaymentSession(fromUser, productName) {
   if (!fromUser) return;
-  const usernameStr = fromUser.username ? `@${fromUser.username}` : 'None';
-  const fullName = [fromUser.first_name, fromUser.last_name].filter(Boolean).join(' ') || 'N/A';
+  // Escape user-provided strings to prevent Markdown parse errors
+  const usernameStr = fromUser.username ? `@${escapeMd(fromUser.username)}` : 'None';
+  const fullName = escapeMd([fromUser.first_name, fromUser.last_name].filter(Boolean).join(' ') || 'N/A');
   const timeStr = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }) + ' IST';
 
   const notice = `💳 *Payment Session Initiated*\n\n` +
@@ -224,133 +238,138 @@ app.post('/api/payment-sms', async (req, res) => {
 
     console.log(`🔎 Extracted RRN: ${rrn}, Amount Received: ${amount !== null ? amount : 'Not specified'}`);
 
+    // --- Core payment fulfillment logic (shared by webhook & UTR submission) ---
+    async function fulfillPayment(pendingTx, receivedAmount, rrn) {
+      const intent = pendingTx.intent;
+      const telegramId = pendingTx.telegram_id;
+      const priceSettingKey = intent === 'course' ? 'course_price' : 'license_price';
+      const targetPriceStr = await getSetting(priceSettingKey, '0');
+      const targetPrice = parseFloat(targetPriceStr) || 0;
+
+      const currentPaid = parseFloat(pendingTx.paid_amount || 0);
+      const newPayment = receivedAmount !== null ? receivedAmount : targetPrice;
+      const totalPaid = currentPaid + newPayment;
+
+      // Handle Partial Payment
+      if (totalPaid < targetPrice) {
+        const remaining = targetPrice - totalPaid;
+        await pool.query(
+          "UPDATE pending_transactions SET paid_amount = $1, status = 'partial_paid', updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+          [totalPaid, pendingTx.id]
+        );
+
+        if (bot && telegramId) {
+          const msgText = `⚠️ *Partial Payment Received*\n\n` +
+            `💰 Received Amount: *Rs. ${newPayment.toFixed(2)}*\n` +
+            `💵 Total Paid So Far: *Rs. ${totalPaid.toFixed(2)}*\n` +
+            `🎯 Required Price: *Rs. ${targetPrice.toFixed(2)}*\n` +
+            `🔻 Remaining Balance: *Rs. ${remaining.toFixed(2)}*\n\n` +
+            `Please pay the remaining amount of *Rs. ${remaining.toFixed(2)}* and resubmit your UTR.`;
+          bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
+        }
+        return { status: 'partial_paid', paid_amount: totalPaid, remaining_amount: remaining };
+      }
+
+      // Full Payment Verified!
+      await pool.query(
+        "UPDATE pending_transactions SET paid_amount = $1, status = 'verified', updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        [totalPaid, pendingTx.id]
+      );
+
+      if (intent === 'license') {
+        const newKey = generateLicenseKey();
+        await pool.query(
+          "INSERT INTO licenses (key, status, telegram_id) VALUES ($1, 'unused', $2)",
+          [newKey, telegramId]
+        );
+
+        if (bot && telegramId) {
+          const msgText = `🎉 *Payment Verified Successfully!*\n\n` +
+            `Thank you for your purchase. Here is your Extension License Key:\n\n` +
+            `\`${newKey}\`\n\n` +
+            `You can activate this key in the extension. View your keys anytime under the *My Key* menu option.`;
+          bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
+        }
+
+        const adminMsg = `✅ *Payment Verification Success*\n\n` +
+          `👤 *Telegram ID:* \`${telegramId}\`\n` +
+          `📦 *Product:* Extension License Key\n` +
+          `💳 *UTR:* \`${rrn}\`\n` +
+          `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}\n` +
+          `🔑 *Generated Key:* \`${newKey}\``;
+        notifyAdmin(adminMsg);
+        return { status: 'verified', intent, utr: rrn, total_paid: totalPaid };
+
+      } else if (intent === 'course') {
+        const courseChannelId = (await getSetting('course_channel_id', '')) || process.env.FORCE_JOIN_CHANNEL_ID || '';
+        let inviteLinkUrl = '';
+
+        if (bot && courseChannelId) {
+          try {
+            const invite = await bot.createChatInviteLink(courseChannelId, {
+              member_limit: 1,
+              expire_date: Math.floor(Date.now() / 1000) + (86400 * 7)
+            });
+            inviteLinkUrl = invite.invite_link;
+          } catch (inviteErr) {
+            console.error('Error generating course channel invite link:', inviteErr?.message || inviteErr);
+          }
+        }
+
+        if (bot && telegramId) {
+          let msgText = `🎉 *Payment Verified Successfully!*\n\n` +
+            `Welcome to the *Learn Website Creation with AI* course!`;
+          if (inviteLinkUrl) {
+            msgText += `\n\nHere is your private, single\-use channel invite link:\n${inviteLinkUrl}`;
+          } else {
+            msgText += `\n\nPlease contact support to get added to the private course channel.`;
+          }
+          bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
+        }
+
+        const adminMsg = `✅ *Payment Verification Success*\n\n` +
+          `👤 *Telegram ID:* \`${telegramId}\`\n` +
+          `📦 *Product:* Learn Website Creation with AI Course\n` +
+          `💳 *UTR:* \`${rrn}\`\n` +
+          `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}`;
+        notifyAdmin(adminMsg);
+        return { status: 'verified', intent, utr: rrn, total_paid: totalPaid };
+      }
+
+      return { status: 'verified', intent, utr: rrn, total_paid: totalPaid };
+    }
+
     const txResult = await pool.query(
       "SELECT * FROM pending_transactions WHERE utr = $1 AND status IN ('pending_verification', 'partial_paid')",
       [rrn]
     );
 
     if (txResult.rows.length === 0) {
-      console.log(`ℹ️ No pending transaction matching UTR: ${rrn}`);
+      // No pending transaction yet — store the received SMS payment for later matching
+      // when user submits UTR via bot
+      console.log(`ℹ️ No pending transaction matching UTR: ${rrn}. Storing received payment for later matching.`);
+      try {
+        await pool.query(
+          `INSERT INTO received_sms_payments (rrn, amount, sms_text, received_at)
+           VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+           ON CONFLICT (rrn) DO UPDATE SET amount = EXCLUDED.amount, sms_text = EXCLUDED.sms_text, received_at = CURRENT_TIMESTAMP`,
+          [rrn, amount, smsText]
+        );
+      } catch (storeErr) {
+        console.error('Error storing received SMS payment:', storeErr?.message || storeErr);
+      }
       return res.status(200).json({
         success: false,
-        message: 'No pending transaction found matching this UTR',
+        message: 'No pending transaction found. Payment stored for matching when UTR is submitted.',
         rrn,
         amount
       });
     }
 
     const pendingTx = txResult.rows[0];
-    const intent = pendingTx.intent;
-    const telegramId = pendingTx.telegram_id;
+    const fulfillResult = await fulfillPayment(pendingTx, amount, rrn);
 
-    const priceSettingKey = intent === 'course' ? 'course_price' : 'license_price';
-    const targetPriceStr = await getSetting(priceSettingKey, '0');
-    const targetPrice = parseFloat(targetPriceStr) || 0;
-
-    const currentPaid = parseFloat(pendingTx.paid_amount || 0);
-    const newPayment = amount !== null ? amount : targetPrice;
-    const totalPaid = currentPaid + newPayment;
-
-    // Handle Partial Payment
-    if (totalPaid < targetPrice) {
-      const remaining = targetPrice - totalPaid;
-      await pool.query(
-        "UPDATE pending_transactions SET paid_amount = $1, status = 'partial_paid', updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-        [totalPaid, pendingTx.id]
-      );
-
-      if (bot && telegramId) {
-        const msgText = `⚠️ *Partial Payment Received*\n\n` +
-          `💰 Received Amount: *Rs. ${newPayment.toFixed(2)}*\n` +
-          `💵 Total Paid So Far: *Rs. ${totalPaid.toFixed(2)}*\n` +
-          `🎯 Required Price: *Rs. ${targetPrice.toFixed(2)}*\n` +
-          `🔻 Remaining Balance: *Rs. ${remaining.toFixed(2)}*\n\n` +
-          `Please pay the remaining amount of *Rs. ${remaining.toFixed(2)}* and resubmit your UTR.`;
-        bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
-      }
-
-      return res.status(200).json({
-        success: true,
-        status: 'partial_paid',
-        paid_amount: totalPaid,
-        remaining_amount: remaining
-      });
-    }
-
-    // Full Payment Verified!
-    await pool.query(
-      "UPDATE pending_transactions SET paid_amount = $1, status = 'verified', updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-      [totalPaid, pendingTx.id]
-    );
-
-    if (intent === 'license') {
-      const newKey = generateLicenseKey();
-      await pool.query(
-        "INSERT INTO licenses (key, status, telegram_id) VALUES ($1, 'unused', $2)",
-        [newKey, telegramId]
-      );
-
-      if (bot && telegramId) {
-        const msgText = `🎉 *Payment Verified Successfully!*\n\n` +
-          `Thank you for your purchase. Here is your Extension License Key:\n\n` +
-          `\`${newKey}\`\n\n` +
-          `You can activate this key in the extension. View your keys anytime under the *My Key* menu option.`;
-        bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
-      }
-
-      // Notify Admin Chat of Verified Payment & License Fulfillment
-      const adminMsg = `✅ *Payment Verification Success*\n\n` +
-        `👤 *Telegram ID:* \`${telegramId}\`\n` +
-        `📦 *Product:* Extension License Key\n` +
-        `💳 *UTR:* \`${rrn}\`\n` +
-        `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}\n` +
-        `🔑 *Generated Key:* \`${newKey}\``;
-      notifyAdmin(adminMsg);
-    } else if (intent === 'course') {
-      const courseChannelId = (await getSetting('course_channel_id', '')) || process.env.FORCE_JOIN_CHANNEL_ID || '';
-      let inviteLinkUrl = '';
-
-      if (bot && courseChannelId) {
-        try {
-          const invite = await bot.createChatInviteLink(courseChannelId, {
-            member_limit: 1,
-            expire_date: Math.floor(Date.now() / 1000) + (86400 * 7)
-          });
-          inviteLinkUrl = invite.invite_link;
-        } catch (inviteErr) {
-          console.error('Error generating course channel invite link:', inviteErr?.message || inviteErr);
-        }
-      }
-
-      if (bot && telegramId) {
-        let msgText = `🎉 *Payment Verified Successfully!*\n\n` +
-          `Welcome to the *Learn Website Creation with AI* course!`;
-
-        if (inviteLinkUrl) {
-          msgText += `\n\nHere is your private, single-use channel invite link:\n${inviteLinkUrl}`;
-        } else {
-          msgText += `\n\nPlease contact support to get added to the private course channel.`;
-        }
-
-        bot.sendMessage(telegramId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
-      }
-
-      // Notify Admin Chat of Verified Payment & Course Fulfillment
-      const adminMsg = `✅ *Payment Verification Success*\n\n` +
-        `👤 *Telegram ID:* \`${telegramId}\`\n` +
-        `📦 *Product:* Learn Website Creation with AI Course\n` +
-        `💳 *UTR:* \`${rrn}\`\n` +
-        `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}`;
-      notifyAdmin(adminMsg);
-    }
-
-    return res.status(200).json({
-      success: true,
-      status: 'verified',
-      intent,
-      utr: rrn,
-      total_paid: totalPaid
-    });
+    return res.status(200).json({ success: true, ...fulfillResult });
 
   } catch (error) {
     console.error('Error handling payment SMS webhook:', error?.message || error);
@@ -1167,12 +1186,116 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
         const targetPriceStr = await getSetting(intent === 'course' ? 'course_price' : 'license_price', '0');
         const targetPrice = parseFloat(targetPriceStr) || 0;
 
+        // Insert or reset pending transaction
         await pool.query(
           `INSERT INTO pending_transactions (telegram_id, intent, utr, amount, paid_amount, status)
            VALUES ($1, $2, $3, $4, 0, 'pending_verification')
-           ON CONFLICT (utr) DO UPDATE SET telegram_id = EXCLUDED.telegram_id, intent = EXCLUDED.intent, status = 'pending_verification'`,
+           ON CONFLICT (utr) DO UPDATE SET telegram_id = EXCLUDED.telegram_id, intent = EXCLUDED.intent,
+             amount = EXCLUDED.amount, paid_amount = 0, status = 'pending_verification', updated_at = CURRENT_TIMESTAMP`,
           [String(chatId), intent, extractedUtr, targetPrice]
         );
+
+        // Check if this payment was already received via SMS webhook (race-condition fix)
+        let alreadyReceived = null;
+        try {
+          const rcvResult = await pool.query(
+            'SELECT rrn, amount FROM received_sms_payments WHERE rrn = $1',
+            [extractedUtr]
+          );
+          if (rcvResult.rows.length > 0) {
+            alreadyReceived = rcvResult.rows[0];
+          }
+        } catch (_) { /* table may not exist yet on first run */ }
+
+        if (alreadyReceived) {
+          // Payment was already received — fulfill now!
+          const pendingTxResult = await pool.query('SELECT * FROM pending_transactions WHERE utr = $1', [extractedUtr]);
+          if (pendingTxResult.rows.length > 0) {
+            const receivedAmt = alreadyReceived.amount !== null ? parseFloat(alreadyReceived.amount) : null;
+            // Import fulfillPayment is not available here — inline the logic
+            const pendingTx = pendingTxResult.rows[0];
+            const txIntent = pendingTx.intent;
+            const txTelegramId = pendingTx.telegram_id;
+            const priceKey = txIntent === 'course' ? 'course_price' : 'license_price';
+            const txPriceStr = await getSetting(priceKey, '0');
+            const txPrice = parseFloat(txPriceStr) || 0;
+            const newPayment = receivedAmt !== null ? receivedAmt : txPrice;
+            const totalPaid = newPayment;
+
+            if (totalPaid >= txPrice) {
+              // Full payment — verify and deliver
+              await pool.query(
+                "UPDATE pending_transactions SET paid_amount = $1, status = 'verified', updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                [totalPaid, pendingTx.id]
+              );
+              // Clean up stored SMS payment
+              pool.query('DELETE FROM received_sms_payments WHERE rrn = $1', [extractedUtr]).catch(() => {});
+              delete userStates[chatId];
+
+              if (txIntent === 'license') {
+                const newKey = generateLicenseKey();
+                await pool.query(
+                  "INSERT INTO licenses (key, status, telegram_id) VALUES ($1, 'unused', $2)",
+                  [newKey, txTelegramId]
+                );
+                await bot.sendMessage(
+                  chatId,
+                  `🎉 *Payment Verified Successfully!*\n\nYour payment of *Rs. ${totalPaid.toFixed(2)}* was already received.\n\nHere is your Extension License Key:\n\n\`${newKey}\`\n\nYou can activate this key in the extension.`,
+                  { parse_mode: 'Markdown' }
+                ).catch(err => console.error('Telegram notification error:', err?.message || err));
+                const adminMsg = `✅ *Payment Verification Success*\n\n` +
+                  `👤 *Telegram ID:* \`${txTelegramId}\`\n` +
+                  `📦 *Product:* Extension License Key\n` +
+                  `💳 *UTR:* \`${extractedUtr}\`\n` +
+                  `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}\n` +
+                  `🔑 *Generated Key:* \`${newKey}\``;
+                notifyAdmin(adminMsg);
+                return;
+              } else if (txIntent === 'course') {
+                const courseChannelId = (await getSetting('course_channel_id', '')) || process.env.FORCE_JOIN_CHANNEL_ID || '';
+                let inviteLinkUrl = '';
+                if (courseChannelId) {
+                  try {
+                    const invite = await bot.createChatInviteLink(courseChannelId, {
+                      member_limit: 1,
+                      expire_date: Math.floor(Date.now() / 1000) + (86400 * 7)
+                    });
+                    inviteLinkUrl = invite.invite_link;
+                  } catch (inviteErr) {
+                    console.error('Error generating course invite link:', inviteErr?.message || inviteErr);
+                  }
+                }
+                let msgText = `🎉 *Payment Verified Successfully!*\n\nWelcome to the *Learn Website Creation with AI* course!`;
+                if (inviteLinkUrl) {
+                  msgText += `\n\nHere is your private, single\-use channel invite link:\n${inviteLinkUrl}`;
+                } else {
+                  msgText += `\n\nPlease contact support to get added to the private course channel.`;
+                }
+                await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' }).catch(err => console.error('Telegram notification error:', err?.message || err));
+                const adminMsg = `✅ *Payment Verification Success*\n\n` +
+                  `👤 *Telegram ID:* \`${txTelegramId}\`\n` +
+                  `📦 *Product:* Learn Website Creation with AI Course\n` +
+                  `💳 *UTR:* \`${extractedUtr}\`\n` +
+                  `💰 *Amount Paid:* Rs. ${totalPaid.toFixed(2)}`;
+                notifyAdmin(adminMsg);
+                return;
+              }
+            } else {
+              // Partial payment already received
+              const remaining = txPrice - totalPaid;
+              await pool.query(
+                "UPDATE pending_transactions SET paid_amount = $1, status = 'partial_paid', updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                [totalPaid, pendingTx.id]
+              );
+              await bot.sendMessage(
+                chatId,
+                `⚠️ *Partial Payment Detected*\n\n💰 Received: *Rs. ${totalPaid.toFixed(2)}*\n🎯 Required: *Rs. ${txPrice.toFixed(2)}*\n🔻 Remaining: *Rs. ${remaining.toFixed(2)}*\n\nPlease pay the remaining amount and resubmit your UTR.`,
+                cancelOpts
+              ).catch(err => console.error('Telegram notification error:', err?.message || err));
+              return;
+            }
+          }
+        }
 
         return bot.sendMessage(
           chatId,

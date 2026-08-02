@@ -71,6 +71,21 @@ async function initDb() {
         CREATE INDEX IF NOT EXISTS idx_pending_tx_utr ON pending_transactions(utr);
       `);
 
+      // Create received_sms_payments table to cache SMS payments received before UTR submission
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS received_sms_payments (
+          id SERIAL PRIMARY KEY,
+          rrn VARCHAR(255) UNIQUE NOT NULL,
+          amount NUMERIC(10, 2),
+          sms_text TEXT,
+          received_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_received_sms_rrn ON received_sms_payments(rrn);
+      `);
+
       console.log('✅ Database schema initialized successfully.');
     } finally {
       client.release();
