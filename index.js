@@ -4,7 +4,7 @@ const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
 
 const { pool, initDb, getSetting, setSetting, getAllSettings, getAdminKeyStats, getActiveLicensesWithUsers } = require('./db');
-const { generateLicenseKey } = require('./keyGenerator');
+const { generateLicenseKey, generateTrialKey } = require('./keyGenerator');
 
 const app = express();
 app.use(cors({
@@ -163,12 +163,18 @@ app.post('/api/activate', async (req, res) => {
       return res.status(200).json({
         success: true,
         message: 'License activated successfully!',
-        status: 'active'
+        status: 'active',
+        is_trial: license.is_trial === true,
+        remaining_prompts: license.remaining_prompts
       });
     }
 
     // Check status: Active -> Verify hardware fingerprint and user device
     if (license.status === 'active') {
+      if (license.is_trial && (license.remaining_prompts ?? 0) <= 0) {
+        return res.status(401).json({ error: 'This key is used , get a new one' });
+      }
+
       if (license.hw_fingerprint) {
         if (requestFingerprint && license.hw_fingerprint !== requestFingerprint) {
           return res.status(401).json({ error: 'Key already bound to another machine/device' });
@@ -190,7 +196,9 @@ app.post('/api/activate', async (req, res) => {
         return res.status(200).json({
           success: true,
           message: 'License verified successfully!',
-          status: 'active'
+          status: 'active',
+          is_trial: license.is_trial === true,
+          remaining_prompts: license.remaining_prompts
         });
       } else {
         return res.status(401).json({ error: 'Key already bound to another user session' });
@@ -200,6 +208,40 @@ app.post('/api/activate', async (req, res) => {
     return res.status(401).json({ error: 'Invalid or revoked key' });
   } catch (error) {
     console.error('Error during license activation:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Trial key prompt usage endpoint (/api/trial/use)
+app.post('/api/trial/use', async (req, res) => {
+  try {
+    const expectedApiKey = process.env.EXTENSION_API_KEY || 'freeflow-be-key-2008';
+    const apiKey = req.headers.apikey || req.headers['apikey'] || req.headers['x-api-key'];
+    if (!apiKey || apiKey !== expectedApiKey) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid API key' });
+    }
+
+    const { license_key } = req.body || {};
+    if (!license_key || !String(license_key).trim()) {
+      return res.status(400).json({ error: 'Missing required parameter: license_key' });
+    }
+
+    const cleanKey = String(license_key).trim();
+    const row = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    if (row.rows.length === 0) {
+      return res.status(404).json({ error: 'Key not found' });
+    }
+    const lic = row.rows[0];
+    if (!lic.is_trial) {
+      return res.status(400).json({ error: 'Not a trial key' });
+    }
+    if ((lic.remaining_prompts ?? 0) <= 0) {
+      return res.status(402).json({ can_send: false, error: 'This key is used , get a new one' });
+    }
+    await pool.query('UPDATE licenses SET remaining_prompts = 0 WHERE key = $1', [cleanKey]);
+    return res.status(200).json({ can_send: true, remaining_prompts: 0 });
+  } catch (error) {
+    console.error('Error in /api/trial/use:', error?.message || error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -438,6 +480,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     const supportUrl = await getSupportUrl();
     return {
       inline_keyboard: [
+        [{ text: '🆓 Get Trial Key', callback_data: 'user_free_trial' }],
         [{ text: '🔑 Buy Key', callback_data: 'user_buy_key' }],
         [{ text: '🎓 Learn website creation with AI', callback_data: 'user_course_intro' }],
         [
@@ -769,6 +812,43 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       } catch (err) {
         console.error('Error fetching user keys:', err?.message || err);
         return safeEditMessage(chatId, messageId, '❌ Failed to fetch your license keys.', opts);
+      }
+    }
+
+    if (data === 'user_free_trial') {
+      const opts = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+          ]
+        }
+      };
+
+      try {
+        const userTelegramId = String(userId);
+        const res = await pool.query(
+          'SELECT * FROM licenses WHERE telegram_id = $1 AND is_trial = true',
+          [userTelegramId]
+        );
+
+        if (res.rows.length > 0) {
+          const existingKey = res.rows[0].key;
+          const reply = `⚠️ *You have already claimed a Free Trial Key!*\n\nYour Trial Key:\n\`${existingKey}\`\n\n*Note:* Only 1 free trial key is allowed per user. Please copy and paste this key into the Freeflow extension login screen to activate your trial.`;
+          return safeEditMessage(chatId, messageId, reply, opts);
+        }
+
+        const newTrialKey = generateTrialKey();
+        await pool.query(
+          "INSERT INTO licenses (key, status, is_trial, remaining_prompts, telegram_id) VALUES ($1, 'unused', true, 1, $2)",
+          [newTrialKey, userTelegramId]
+        );
+
+        const reply = `🎉 *Free Trial Key Generated!*\n\nYour Free Trial Key:\n\`${newTrialKey}\`\n\n👉 Copy and paste this key into the Freeflow extension login screen to get started!`;
+        return safeEditMessage(chatId, messageId, reply, opts);
+      } catch (err) {
+        console.error('Error in user_free_trial:', err?.message || err);
+        return safeEditMessage(chatId, messageId, '❌ Failed to generate your free trial key.', opts);
       }
     }
 

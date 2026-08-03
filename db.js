@@ -36,6 +36,8 @@ async function initDb() {
       await client.query(`
         ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hw_fingerprint VARCHAR(255);
         ALTER TABLE licenses ADD COLUMN IF NOT EXISTS telegram_id VARCHAR(255);
+        ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_trial BOOLEAN DEFAULT FALSE;
+        ALTER TABLE licenses ADD COLUMN IF NOT EXISTS remaining_prompts INTEGER DEFAULT NULL;
       `);
 
       await client.query(`

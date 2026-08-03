@@ -30,6 +30,20 @@ function generateLicenseKey() {
   return `${prefix}-${c1}-${c2}-${c3}-${c4}`;
 }
 
+/**
+ * Generates a trial license key in the format: FF-TRIAL-XXXX-XXXX-XXXX
+ * @returns {string} Example: FF-TRIAL-A1B2-C3D4-E5F6
+ */
+function generateTrialKey() {
+  const prefix = 'FF-TRIAL';
+  const c1 = generateChunk(4);
+  const c2 = generateChunk(4);
+  const c3 = generateChunk(4);
+  return `${prefix}-${c1}-${c2}-${c3}`;
+}
+
 module.exports = {
   generateLicenseKey,
+  generateTrialKey,
 };
+
