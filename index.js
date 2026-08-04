@@ -246,6 +246,35 @@ app.post('/api/trial/use', async (req, res) => {
   }
 });
 
+// Get tab visibility settings endpoint (/api/tab-settings)
+app.get('/api/tab-settings', async (req, res) => {
+  try {
+    const showFreeTrial = (await getSetting('tab_show_free_trial', 'true')) === 'true';
+    const showBuyKey = (await getSetting('tab_show_buy_key', 'true')) === 'true';
+    const showCourse = (await getSetting('tab_show_course', 'true')) === 'true';
+    const showDownloadExt = (await getSetting('tab_show_download_ext', 'true')) === 'true';
+    const showHowToUse = (await getSetting('tab_show_how_to_use', 'true')) === 'true';
+    const showSupport = (await getSetting('tab_show_support', 'true')) === 'true';
+    const showMyKey = (await getSetting('tab_show_my_key', 'true')) === 'true';
+
+    return res.status(200).json({
+      success: true,
+      tabs: {
+        free_trial: showFreeTrial,
+        buy_key: showBuyKey,
+        course: showCourse,
+        download_ext: showDownloadExt,
+        how_to_use: showHowToUse,
+        support: showSupport,
+        my_key: showMyKey
+      }
+    });
+  } catch (error) {
+    console.error('Error in /api/tab-settings:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Macrodroid Payment SMS Webhook Endpoint (/api/payment-sms)
 app.post('/api/payment-sms', async (req, res) => {
   try {
@@ -478,21 +507,50 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
   // --- Main User Menu Helpers ---
   async function getMainUserKeyboard() {
     const supportUrl = await getSupportUrl();
-    return {
-      inline_keyboard: [
-        [{ text: '🆓 Get Trial Key', callback_data: 'user_free_trial' }],
-        [{ text: '🔑 Buy Key', callback_data: 'user_buy_key' }],
-        [{ text: '🎓 Learn website creation with AI', callback_data: 'user_course_intro' }],
-        [
-          { text: '📥 Get Extension', callback_data: 'user_download_ext' },
-          { text: '📖 How to Use', callback_data: 'user_how_to_use' }
-        ],
-        [
-          { text: '💬 Support', url: supportUrl },
-          { text: '🔐 My Key', callback_data: 'user_my_key' }
-        ]
-      ]
-    };
+
+    const showFreeTrial = (await getSetting('tab_show_free_trial', 'true')) === 'true';
+    const showBuyKey = (await getSetting('tab_show_buy_key', 'true')) === 'true';
+    const showCourse = (await getSetting('tab_show_course', 'true')) === 'true';
+    const showDownloadExt = (await getSetting('tab_show_download_ext', 'true')) === 'true';
+    const showHowToUse = (await getSetting('tab_show_how_to_use', 'true')) === 'true';
+    const showSupport = (await getSetting('tab_show_support', 'true')) === 'true';
+    const showMyKey = (await getSetting('tab_show_my_key', 'true')) === 'true';
+
+    const inline_keyboard = [];
+
+    if (showFreeTrial) {
+      inline_keyboard.push([{ text: '🆓 Get Trial Key', callback_data: 'user_free_trial' }]);
+    }
+    if (showBuyKey) {
+      inline_keyboard.push([{ text: '🔑 Buy Key', callback_data: 'user_buy_key' }]);
+    }
+    if (showCourse) {
+      inline_keyboard.push([{ text: '🎓 Learn website creation with AI', callback_data: 'user_course_intro' }]);
+    }
+
+    const row4 = [];
+    if (showDownloadExt) {
+      row4.push({ text: '📥 Get Extension', callback_data: 'user_download_ext' });
+    }
+    if (showHowToUse) {
+      row4.push({ text: '📖 How to Use', callback_data: 'user_how_to_use' });
+    }
+    if (row4.length > 0) {
+      inline_keyboard.push(row4);
+    }
+
+    const row5 = [];
+    if (showSupport) {
+      row5.push({ text: '💬 Support', url: supportUrl });
+    }
+    if (showMyKey) {
+      row5.push({ text: '🔐 My Key', callback_data: 'user_my_key' });
+    }
+    if (row5.length > 0) {
+      inline_keyboard.push(row5);
+    }
+
+    return { inline_keyboard };
   }
 
   async function getMainUserText() {
@@ -565,6 +623,7 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
           [{ text: '🎓 Set Course Intro Msg', callback_data: 'admin_set_course_intro' }],
           [{ text: '📦 Upload Extension (.zip)', callback_data: 'admin_upload_ext' }],
           [{ text: '📖 Set "How to Use" Msg', callback_data: 'admin_set_how_to_use' }],
+          [{ text: '🎛️ Toggle User Tabs', callback_data: 'admin_toggle_tabs' }],
           [
             { text: '➕ Generate New Key', callback_data: 'admin_new_key' },
             { text: '📊 Key Statistics', callback_data: 'admin_key_stats' }
@@ -575,6 +634,40 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     };
 
     const text = `⚙️ *Admin Management Panel*\n\nSelect an option below to manage bot settings or keys:`;
+    if (messageId) {
+      return safeEditMessage(chatId, messageId, text, opts);
+    } else {
+      return bot.sendMessage(chatId, text, opts).catch(err => console.error('Telegram sendMessage error:', err?.message || err));
+    }
+  }
+
+  // --- Admin Tab Visibility Control Helper ---
+  async function sendAdminTabToggleMenu(chatId, messageId = null) {
+    const showFreeTrial = (await getSetting('tab_show_free_trial', 'true')) === 'true';
+    const showBuyKey = (await getSetting('tab_show_buy_key', 'true')) === 'true';
+    const showCourse = (await getSetting('tab_show_course', 'true')) === 'true';
+    const showDownloadExt = (await getSetting('tab_show_download_ext', 'true')) === 'true';
+    const showHowToUse = (await getSetting('tab_show_how_to_use', 'true')) === 'true';
+    const showSupport = (await getSetting('tab_show_support', 'true')) === 'true';
+    const showMyKey = (await getSetting('tab_show_my_key', 'true')) === 'true';
+
+    const opts = {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: `🆓 Trial Key: ${showFreeTrial ? '✅ Visible' : '❌ Hidden'}`, callback_data: 'toggle_tab_free_trial' }],
+          [{ text: `🔑 Buy Key: ${showBuyKey ? '✅ Visible' : '❌ Hidden'}`, callback_data: 'toggle_tab_buy_key' }],
+          [{ text: `🎓 Learn Course: ${showCourse ? '✅ Visible' : '❌ Hidden'}`, callback_data: 'toggle_tab_course' }],
+          [{ text: `📥 Extension Download: ${showDownloadExt ? '✅ Visible' : '❌ Hidden'}`, callback_data: 'toggle_tab_download_ext' }],
+          [{ text: `📖 How to Use: ${showHowToUse ? '✅ Visible' : '❌ Hidden'}`, callback_data: 'toggle_tab_how_to_use' }],
+          [{ text: `💬 Support: ${showSupport ? '✅ Visible' : '❌ Hidden'}`, callback_data: 'toggle_tab_support' }],
+          [{ text: `🔐 My Key: ${showMyKey ? '✅ Visible' : '❌ Hidden'}`, callback_data: 'toggle_tab_my_key' }],
+          [{ text: '🔙 Back to Admin', callback_data: 'back_to_admin' }]
+        ]
+      }
+    };
+
+    const text = `🎛️ *User UI Tab Visibility Control*\n\nClick any tab button below to toggle whether it is shown (✅) or hidden (❌) to final users in the bot and API:`;
     if (messageId) {
       return safeEditMessage(chatId, messageId, text, opts);
     } else {
@@ -644,11 +737,63 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       return safeEditMessage(chatId, messageId, 'Transaction canceled.', opts);
     }
 
+    // Admin Toggle User Tabs Submenu Callback
+    if (data === 'admin_toggle_tabs') {
+      if (!isAuthorizedAdmin(userId)) return;
+      return sendAdminTabToggleMenu(chatId, messageId);
+    }
+
+    // Toggle specific tab callback
+    if (data.startsWith('toggle_tab_')) {
+      if (!isAuthorizedAdmin(userId)) return;
+      const tabName = data.replace('toggle_tab_', '');
+      const keyMap = {
+        'free_trial': 'tab_show_free_trial',
+        'buy_key': 'tab_show_buy_key',
+        'course': 'tab_show_course',
+        'download_ext': 'tab_show_download_ext',
+        'how_to_use': 'tab_show_how_to_use',
+        'support': 'tab_show_support',
+        'my_key': 'tab_show_my_key'
+      };
+
+      const settingKey = keyMap[tabName];
+      if (settingKey) {
+        const currentVal = await getSetting(settingKey, 'true');
+        const newVal = currentVal === 'true' ? 'false' : 'true';
+        await setSetting(settingKey, newVal);
+      }
+      return sendAdminTabToggleMenu(chatId, messageId);
+    }
+
     // Check membership for all non-admin user callback buttons
     if (!isAuthorizedAdmin(userId)) {
       const isMember = await checkUserMembership(userId);
       if (!isMember) {
         return sendForceJoinPrompt(chatId);
+      }
+    }
+
+    // Guard: Verify if targeted tab is enabled before serving user callbacks
+    const tabCheckMap = {
+      'user_free_trial': 'tab_show_free_trial',
+      'user_buy_key': 'tab_show_buy_key',
+      'user_course_intro': 'tab_show_course',
+      'user_buy_course': 'tab_show_course',
+      'user_download_ext': 'tab_show_download_ext',
+      'user_how_to_use': 'tab_show_how_to_use',
+      'user_my_key': 'tab_show_my_key'
+    };
+
+    if (tabCheckMap[data]) {
+      const isEnabled = (await getSetting(tabCheckMap[data], 'true')) === 'true';
+      if (!isEnabled) {
+        return safeEditMessage(chatId, messageId, '⚠️ *This feature is currently disabled by administrator.*', {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]]
+          }
+        });
       }
     }
 
