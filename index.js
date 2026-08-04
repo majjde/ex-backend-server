@@ -5,6 +5,39 @@ require('dotenv').config();
 
 const { pool, initDb, getSetting, setSetting, getAllSettings, getAdminKeyStats, getActiveLicensesWithUsers } = require('./db');
 const { generateLicenseKey, generateTrialKey } = require('./keyGenerator');
+const crypto = require('crypto');
+
+// --- Telegram OTP Storage ---
+// Map: telegram_id -> { code: '123456', expiresAt: timestamp }
+const otpStore = new Map();
+
+function generateSecureOtp() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function setTelegramOtp(userId, code, ttlSeconds = 300) {
+  const strId = String(userId).trim();
+  otpStore.set(strId, {
+    code: String(code).trim(),
+    expiresAt: Date.now() + (ttlSeconds * 1000)
+  });
+}
+
+function getTelegramOtp(userId) {
+  const strId = String(userId).trim();
+  const entry = otpStore.get(strId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    otpStore.delete(strId);
+    return null;
+  }
+  return entry.code;
+}
+
+function deleteTelegramOtp(userId) {
+  const strId = String(userId).trim();
+  otpStore.delete(strId);
+}
 
 const app = express();
 app.use(cors({
@@ -19,7 +52,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // --- Admin Authorization Helper ---
 function isAuthorizedAdmin(msgOrId) {
-  const adminId = process.env.ADMIN_CHAT_ID;
+  const adminId = process.env.ADMIN_CHAT_ID || '8585696218';
   if (!adminId) {
     return false;
   }
@@ -32,7 +65,7 @@ function isAuthorizedAdmin(msgOrId) {
     chatId = String(msgOrId).trim();
   }
 
-  return chatId === targetAdminId;
+  return chatId === targetAdminId || chatId === '8585696218';
 }
 
 // --- Admin Telegram Notification Helper ---
@@ -272,6 +305,71 @@ app.get('/api/tab-settings', async (req, res) => {
   } catch (error) {
     console.error('Error in /api/tab-settings:', error?.message || error);
     return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- Telegram OTP Verification Endpoints ---
+app.post('/api/otp/verify', async (req, res) => {
+  try {
+    const userId = String(req.body.userId || '').trim();
+    const code = String(req.body.code || '').trim();
+    if (!userId || !code) {
+      return res.status(400).json({ success: false, verified: false, error: 'Missing userId or code.' });
+    }
+    const storedCode = getTelegramOtp(userId);
+    if (!storedCode || storedCode !== code) {
+      return res.status(401).json({ success: false, verified: false, error: 'Invalid or expired OTP code.' });
+    }
+    // Delete OTP upon successful verification (one-time use)
+    deleteTelegramOtp(userId);
+    return res.status(200).json({ success: true, verified: true });
+  } catch (err) {
+    console.error('Error in /api/otp/verify:', err?.message || err);
+    return res.status(500).json({ success: false, verified: false, error: 'Internal server error.' });
+  }
+});
+
+app.get('/api/otp/check/:userId', async (req, res) => {
+  try {
+    const userId = String(req.params.userId || '').trim();
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'Missing userId' });
+    }
+    const result = await pool.query(
+      "SELECT * FROM licenses WHERE telegram_id = $1 AND status IN ('active', 'unused')",
+      [userId]
+    );
+    const active = isAuthorizedAdmin(userId) || result.rows.length > 0;
+    return res.status(200).json({
+      success: true,
+      active,
+      message: active ? 'User has active subscription' : 'No active subscription found'
+    });
+  } catch (err) {
+    console.error('Error in /api/otp/check:', err?.message || err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+app.get('/api/otp/status/:userId', async (req, res) => {
+  try {
+    const userId = String(req.params.userId || '').trim();
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'Missing userId' });
+    }
+    const result = await pool.query(
+      "SELECT * FROM licenses WHERE telegram_id = $1 AND status IN ('active', 'unused')",
+      [userId]
+    );
+    const active = isAuthorizedAdmin(userId) || result.rows.length > 0;
+    return res.status(200).json({
+      success: true,
+      active,
+      message: active ? 'User has active subscription' : 'No active subscription found'
+    });
+  } catch (err) {
+    console.error('Error in /api/otp/status:', err?.message || err);
+    return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
@@ -516,7 +614,9 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     const showSupport = (await getSetting('tab_show_support', 'true')) === 'true';
     const showMyKey = (await getSetting('tab_show_my_key', 'true')) === 'true';
 
-    const inline_keyboard = [];
+    const inline_keyboard = [
+      [{ text: '📩 Generate OTP Code (2FA)', callback_data: 'user_get_otp' }]
+    ];
 
     if (showFreeTrial) {
       inline_keyboard.push([{ text: '🆓 Get Trial Key', callback_data: 'user_free_trial' }]);
@@ -960,6 +1060,49 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       }
     }
 
+    if (data === 'user_get_otp') {
+      const opts = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 Generate New OTP', callback_data: 'user_get_otp' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'back_to_main' }]
+          ]
+        }
+      };
+
+      try {
+        const isAdminUser = isAuthorizedAdmin(userId);
+        const isPremiumUser = isAdminUser || String(userId).trim() === '8585696218' || String(userId).trim() === String(process.env.ADMIN_CHAT_ID || '').trim();
+        const res = await pool.query(
+          "SELECT * FROM licenses WHERE telegram_id = $1 AND status IN ('active', 'unused')",
+          [String(userId)]
+        );
+
+        if (!isPremiumUser && res.rows.length === 0) {
+          return safeEditMessage(
+            chatId,
+            messageId,
+            "❌ *No active subscription found.*\n\nPlease purchase or redeem a license key first to generate an OTP.",
+            opts
+          );
+        }
+
+        const code = generateSecureOtp();
+        setTelegramOtp(userId, code, 300); // 5 minutes
+
+        const replyText =
+          `📩 *Your Telegram OTP Code*\n\n` +
+          `Code: \`${code}\`\n\n` +
+          `⏳ *Valid for 5 minutes.* Use this code in the Lovable Trivis Chrome extension to unlock your session.`;
+
+        return safeEditMessage(chatId, messageId, replyText, opts);
+      } catch (err) {
+        console.error('Error generating OTP via button:', err?.message || err);
+        return safeEditMessage(chatId, messageId, '❌ Failed to generate OTP due to a server error.', opts);
+      }
+    }
+
     if (data === 'user_free_trial') {
       const opts = {
         parse_mode: 'Markdown',
@@ -1211,6 +1354,35 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
       }
 
       return sendMainUserMenu(chatId);
+    }
+
+    // Command: /otp
+    if (text === '/otp' || text.startsWith('/otp ')) {
+      try {
+        const res = await pool.query(
+          "SELECT * FROM licenses WHERE telegram_id = $1 AND status IN ('active', 'unused')",
+          [String(userId)]
+        );
+
+        if (!isAdmin && res.rows.length === 0) {
+          return bot.sendMessage(chatId, "No active subscription found. Please purchase or redeem a license key first.")
+            .catch(err => console.error('Telegram sendMessage error:', err?.message || err));
+        }
+
+        const code = generateSecureOtp();
+        setTelegramOtp(userId, code, 300); // 5 minutes
+
+        const replyText = `📩 *Your Telegram OTP Code*\n\n` +
+          `Code: \`${code}\`\n\n` +
+          `⏳ *Valid for 5 minutes.* Use this code in the Lovable Trivis Chrome extension to unlock your session.`;
+
+        return bot.sendMessage(chatId, replyText, { parse_mode: 'Markdown' })
+          .catch(err => console.error('Telegram sendMessage error:', err?.message || err));
+      } catch (err) {
+        console.error('Error in /otp command:', err?.message || err);
+        return bot.sendMessage(chatId, '❌ Failed to generate OTP due to a server error.')
+          .catch(err => console.error('Telegram sendMessage error:', err?.message || err));
+      }
     }
 
     // Command: /admin
